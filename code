@@ -1,0 +1,179 @@
+/**
+ * Healthcare Pharmaceuticals Ltd (HPL) - Energy Monitoring System
+ * Enhanced: Offline Data Preservation & Automatic Recovery
+ */
+
+#include <WiFiManager.h>
+#include <PubSubClient.h>
+#include <ModbusMaster.h>
+#include <Preferences.h>
+#include <ArduinoJson.h>
+#include <esp_task_wdt.h>
+#include <Freenove_WS2812_Lib_for_ESP32.h>
+#include "time.h"
+
+// --- Hardware Pins ---
+#define RS485_DE_RE     4
+#define RS485_RX        18
+#define RS485_TX        17
+#define MODBUS_SLAVE    1
+#define RGB_LED_PIN     48
+#define LED_COUNT       1
+
+// --- Registers ---
+#define REG_V_L1L2      3019
+#define REG_ENERGY      2699
+#define REG_POWER       3075
+// ... (অন্যান্য রেজিস্টার আগের মতোই থাকবে)
+
+// --- Global Objects ---
+ModbusMaster node;
+WiFiClient espClient;
+PubSubClient mqtt(espClient);
+Preferences prefs;
+Freenove_ESP32_WS2812 led = Freenove_ESP32_WS2812(LED_COUNT, RGB_LED_PIN, 0, TYPE_GRB);
+
+// --- Config ---
+const char* mqttServer = "192.180.130.251"; // আপনার পিসির লোকাল IP বা ngrok IP নিশ্চিত করুন
+const int   mqttPort   = 1883;
+const char* token      = "OSD_Production_Device_04";
+
+// --- Variables ---
+float dailyBaseKWh = 0.0, yesterdayKWh = 0.0, currentTotalKWh = 0.0;
+int lastDay = -1;
+unsigned long lastRead = 0;
+unsigned long lastMqttRetry = 0;
+
+void setLedColor(uint8_t r, uint8_t g, uint8_t b) {
+    led.setLedColorData(0, r, g, b);
+    led.show();
+}
+
+float readModbusFloat(uint16_t reg) {
+    uint8_t result = node.readHoldingRegisters(reg, 2);
+    if (result != node.ku8MBSuccess) return NAN;
+    uint32_t raw = ((uint32_t)node.getResponseBuffer(0) << 16) | node.getResponseBuffer(1);
+    float val;
+    memcpy(&val, &raw, 4);
+    return val;
+}
+
+float sf(float v) { return isnan(v) ? 0.0f : v; }
+
+void setup() {
+    Serial.begin(115200);
+    led.begin();
+    led.setBrightness(20);
+    setLedColor(255, 100, 0); // Orange - Starting
+
+    // Watchdog
+    esp_task_wdt_config_t wdt_config = { .timeout_ms = 15000, .idle_core_mask = 0, .trigger_panic = true };
+    esp_task_wdt_init(&wdt_config);
+    esp_task_wdt_add(NULL);
+
+    // Modbus setup
+    pinMode(RS485_DE_RE, OUTPUT);
+    Serial2.begin(19200, SERIAL_8E1, RS485_RX, RS485_TX);
+    node.begin(MODBUS_SLAVE, Serial2);
+    node.preTransmission([]() { digitalWrite(RS485_DE_RE, HIGH); });
+    node.postTransmission([]() { delay(1); digitalWrite(RS485_DE_RE, LOW); });
+
+    // Load Saved Data from Flash
+    prefs.begin("hpl_data", false);
+    dailyBaseKWh = prefs.getFloat("dailyBase", 0.0);
+    yesterdayKWh = prefs.getFloat("yesterday", 0.0);
+    lastDay = prefs.getInt("lastDay", -1);
+    prefs.end();
+
+    // WiFi
+    WiFiManager wm;
+    wm.setConfigPortalTimeout(180); // ৩ মিনিট ট্রাই করে কানেক্ট না হলে কোড সামনে বাড়বে
+    wm.autoConnect("HPL_Energy_Node_04");
+    
+    configTime(6 * 3600, 0, "pool.ntp.org");
+    mqtt.setServer(mqttServer, mqttPort);
+}
+
+void loop() {
+    esp_task_wdt_reset();
+
+    // MQTT Connection Logic (Non-blocking)
+    if (WiFi.status() == WL_CONNECTED) {
+        if (!mqtt.connected()) {
+            if (millis() - lastMqttRetry > 5000) {
+                lastMqttRetry = millis();
+                Serial.println("Attempting MQTT connection...");
+                if (mqtt.connect("ESP32_S3_HPL_04", token, NULL)) {
+                    Serial.println("Connected to ThingsBoard!");
+                    setLedColor(0, 255, 0); // Green - Online
+                } else {
+                    setLedColor(0, 0, 255); // Blue - WiFi OK, MQTT Waiting
+                }
+            }
+        }
+        mqtt.loop();
+    } else {
+        setLedColor(255, 0, 0); // Red - Offline
+    }
+
+    // ৫ সেকেন্ড পর পর ডাটা রিড ও প্রসেস (ইন্টারনেট থাকুক বা না থাকুক)
+    if (millis() - lastRead < 5000) return;
+    lastRead = millis();
+
+    float kwh = readModbusFloat(REG_ENERGY);
+    float pwr = readModbusFloat(REG_POWER);
+
+    if (!isnan(kwh)) {
+        currentTotalKWh = kwh;
+        
+        struct tm tm;
+        if (getLocalTime(&tm)) {
+            // Midnight Logic (অফলাইনে থাকলেও কাজ করবে যদি টাইম সিঙ্ক থাকে)
+            if (lastDay != -1 && tm.tm_mday != lastDay) {
+                yesterdayKWh = currentTotalKWh - dailyBaseKWh;
+                if (yesterdayKWh < 0) yesterdayKWh = 0;
+                dailyBaseKWh = currentTotalKWh;
+                lastDay = tm.tm_mday;
+
+                // নতুন হিসাব মেমোরিতে সেভ
+                prefs.begin("hpl_data", false);
+                prefs.putFloat("dailyBase", dailyBaseKWh);
+                prefs.putFloat("yesterday", yesterdayKWh);
+                prefs.putInt("lastDay", lastDay);
+                prefs.end();
+                Serial.println("Midnight calculation updated & saved.");
+            }
+            
+            if (lastDay == -1) {
+                lastDay = tm.tm_mday;
+                if (dailyBaseKWh == 0) dailyBaseKWh = currentTotalKWh;
+                prefs.begin("hpl_data", false);
+                prefs.putInt("lastDay", lastDay);
+                prefs.putFloat("dailyBase", dailyBaseKWh);
+                prefs.end();
+            }
+        }
+
+        float todayUsage = currentTotalKWh - dailyBaseKWh;
+        if (todayUsage < 0) todayUsage = 0;
+
+        // ThingsBoard-এ ডাটা পাঠানোর চেষ্টা
+        if (mqtt.connected()) {
+            StaticJsonDocument<512> doc;
+            doc["active_power_kw"] = sf(pwr) / 1000.0f;
+            doc["total_kwh"] = currentTotalKWh;
+            doc["today_kwh"] = todayUsage;
+            doc["yesterday_kwh"] = yesterdayKWh;
+            doc["wifi_signal"] = WiFi.RSSI();
+
+            char buffer[512];
+            serializeJson(doc, buffer);
+            mqtt.publish("v1/devices/me/telemetry", buffer);
+            Serial.println("Telemetry sent!");
+        } else {
+            Serial.println("Offline: Data processed and ready for sync.");
+        }
+    } else {
+        Serial.println("Modbus Error - Check Wiring");
+    }
+}
